@@ -3,7 +3,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import pytorch_lightning as pl
-import os
 
 
 class Stage1Model(pl.LightningModule):
@@ -12,28 +11,8 @@ class Stage1Model(pl.LightningModule):
         self.model = FaceModel()
 
     def forward(self, x):
-        y = self.model(x)
+        y = self.model.forward(x)
         return y
-
-    @classmethod
-    def load_from_checkpoint(cls, checkpoint_path, map_location=None):
-        """
-        Primary way of loading model from a checkpoint
-        :param checkpoint_path:
-        :param map_location: dic for mapping storage {'cuda:1':'cuda:0'}
-        :return:
-        """
-        # load the state_dict on the model automatically
-
-        path = os.path.join(checkpoint_path, 'best.pth.tar')
-        if map_location is not None:
-            state = torch.load(path, map_location=map_location)
-        else:
-            state = torch.load(path,
-                               map_location=lambda storage, loc: storage)
-
-        cls.model1.load_state_dict(state['model'])
-        return cls
 
 
 class Stage2Model(pl.LightningModule):
@@ -59,25 +38,6 @@ class Stage2Model(pl.LightningModule):
 
         return predict
 
-    @classmethod
-    def load_from_checkpoint(cls, checkpoint_path, map_location=None):
-        """
-        Primary way of loading model from a checkpoint
-        :param checkpoint_path:
-        :param map_location: dic for mapping storage {'cuda:1':'cuda:0'}
-        :return:
-        """
-        name_list = ['eyebrows', 'eyes', 'nose', 'mouth']
-        if map_location is not None:
-            checkpoint = [torch.load(os.path.join(checkpoint_path, x + 'pth.tar'), map_location=map_location)
-                          for x in name_list]
-        else:
-            checkpoint = [torch.load(os.path.join(checkpoint_path, x + 'pth.tar'),
-                                     map_location=lambda storage, loc: storage)
-                          for x in name_list]
-        for i in range(4):
-            cls.model[i].load_state_dict(checkpoint[name_list[i]]['model'])
-
 
 class SelectNet(nn.Module):
     def __init__(self):
@@ -99,18 +59,19 @@ class SelectNet(nn.Module):
                                 dim=1)
         assert self.points.shape == (n, 6, 2)
         self.theta = torch.zeros((n, 6, 2, 3), dtype=torch.float32, device=self.device, requires_grad=False)
+        # I'm going to cut all of parts into 81x81
         # Eyes,eyebrows,nose theta
         for i in range(5):
-            self.theta[:, i, 0, 0] = 80 / w
-            self.theta[:, i, 0, 2] = -1 + (2 * self.points[:, i, 1]) / w
-            self.theta[:, i, 1, 1] = 80 / h
-            self.theta[:, i, 1, 2] = -1 + (2 * self.points[:, i, 0]) / h
+            self.theta[:, i, 0, 0] = (81 -1) / (w -1)
+            self.theta[:, i, 0, 2] = -1 + (2 * self.points[:, i, 1]) / (w -1)
+            self.theta[:, i, 1, 1] = (81 -1) / h
+            self.theta[:, i, 1, 2] = -1 + (2 * self.points[:, i, 0]) / (h -1)
         # Mouth theta
         for i in range(5, 6):
-            self.theta[:, i, 0, 0] = 80 / w
-            self.theta[:, i, 0, 2] = -1 + (2 * self.points[:, i, 1]) / w
-            self.theta[:, i, 1, 1] = 80 / h
-            self.theta[:, i, 1, 2] = -1 + (2 * self.points[:, i, 0]) / h
+            self.theta[:, i, 0, 0] = (81-1) / (w-1)
+            self.theta[:, i, 0, 2] = -1 + (2 * self.points[:, i, 1]) / (w - 1)
+            self.theta[:, i, 1, 1] = (81-1) / h
+            self.theta[:, i, 1, 2] = -1 + (2 * self.points[:, i, 0]) / (h - 1)
         croped_image = self.crop_image()
         croped_pred = self.crop_label()
         return croped_image, croped_pred
@@ -121,11 +82,11 @@ class SelectNet(nn.Module):
         theta_in = self.theta
         samples = []
         for i in range(6):
-            grid = F.affine_grid(theta_in[:, i], [N, 3, 80, 80], align_corners=True).to(self.device)
+            grid = F.affine_grid(theta_in[:, i], [N, 3, 81, 81], align_corners=True).to(self.device)
             samples.append(F.grid_sample(input=img_in, grid=grid, align_corners=True,
                                          mode='bilinear', padding_mode='zeros'))
         samples = torch.stack(samples, dim=1)
-        assert samples.shape == (N, 6, 3, 80, 80)
+        assert samples.shape == (N, 6, 3, 81, 81)
         return samples
 
     def crop_label(self):
@@ -134,11 +95,11 @@ class SelectNet(nn.Module):
         label = self.label.float()
         N, L = label.shape[0], label.shape[1]
         for i in range(6):
-            grid = F.affine_grid(theta[:, i], [N, L, 80, 80], align_corners=True).to(label.device)
+            grid = F.affine_grid(theta[:, i], [N, L, 81, 81], align_corners=True).to(label.device)
             labels.append(
                 F.grid_sample(input=torch.unsqueeze(label, dim=1), mode='nearest', grid=grid, align_corners=True))
         labels = torch.cat(labels, dim=1)
-        assert labels.shape == (N, 6, 80, 80)
+        assert labels.shape == (N, 6, 81, 81)
         mouth_labels = labels[:, 5:6]
         mouth_labels[(mouth_labels != 6) * (mouth_labels != 7) * (mouth_labels != 8)] = 0  # bg
         mouth_labels[mouth_labels == 6] = 1  # up_lip
@@ -149,7 +110,7 @@ class SelectNet(nn.Module):
             labels[:, i][labels[:, i] == i + 1] = 1
 
         labels = torch.cat([labels[:, 0:5], mouth_labels], dim=1)
-        assert labels.shape == (N, 6, 80, 80)
+        assert labels.shape == (N, 6, 81, 81)
         return labels
 
 
